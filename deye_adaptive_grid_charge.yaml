@@ -1,0 +1,381 @@
+blueprint:
+  name: "Deye / Sunsynk — Адаптивный ток заряда от сети по напряжению линии"
+  description: >
+    Автоматически регулирует ток заряда аккумулятора от сети (Modbus Reg 230 —
+    Grid Charge Battery Current) на инверторах Deye / Sunsynk (через локальные
+    интеграции Solarman, ESPHome или Sunsynk Add-on), удерживая входное
+    напряжение сети не ниже безопасного порога и защищая EEPROM инвертора от
+    лишних перезаписей.
+
+
+    Алгоритм (асимметричный AIMD с мёртвой зоной):
+
+    1. Блекаут (V_grid < порога блекаута): однократно паркует ток на безопасном
+       стартовом значении (по умолчанию 10 А), чтобы при подаче света не просадить
+       линию высоким пусковым током заряда.
+
+    2. Батарея заряжена (SOC >= порога парковки): паркует ток на безопасном
+       значении и прекращает запись в Modbus.
+
+    3. Аварийная просадка (V_grid < аварийного порога): мгновенно сбрасывает ток
+       заряда до минимума (0 А).
+
+    4. Ниже коридора (V_crit <= V_grid < V_low) или превышение лимита мощности
+       ввода: пропорционально снижает ток заряда (не чаще раза в 25 сек).
+
+    5. Безопасный коридор (V_low <= V_grid <= V_high): мёртвая зона — 0 записей
+       в регистр инвертора.
+
+    6. Свободная линия (V_grid > V_high): плавно повышает ток на заданный шаг
+       раз в 2–3 минуты вплоть до максимума с учётом запаса мощности ввода.
+  domain: automation
+  source_url: https://github.com/ofedotov/ha-deye-adaptive-charge/blob/main/deye_adaptive_grid_charge.yaml
+  input:
+    inverter_device:
+      name: "Устройство инвертора (необязательно)"
+      description: "Выберите устройство инвертора Deye/Sunsynk в Home Assistant (опционально, для удобства идентификации)."
+      default:
+      selector:
+        device: {}
+
+    grid_voltage_sensor:
+      name: "Сенсор входного напряжения сети (Grid Voltage, В)"
+      description: "Сущность напряжения сети на входе инвертора (Reg 150, например sensor.deye_grid_voltage)."
+      selector:
+        entity:
+          domain: sensor
+
+    charge_current_number:
+      name: "Регулятор тока заряда от сети (Grid Charge Current, А)"
+      description: "Сущность настройки максимального тока заряда от сети (Reg 230, например number.deye_grid_charge_battery_current)."
+      selector:
+        entity:
+          domain: number
+
+    battery_soc_sensor:
+      name: "Сенсор заряда батареи SOC % (рекомендуется)"
+      description: "Сущность уровня заряда АКБ (Reg 184). Замораживает записи в память инвертора, когда батарея заряжена."
+      default:
+      selector:
+        entity:
+          domain: sensor
+
+    grid_power_sensor:
+      name: "Сенсор общей мощности из сети (Grid Power, Вт — опционально)"
+      description: "Сущность входной мощности из сети (Reg 169 / External CT Power) для защиты от перегрузки ввода и инвертора."
+      default:
+      selector:
+        entity:
+          domain: sensor
+
+    v_offgrid_cutoff:
+      name: "Порог определения блекаута (В)"
+      description: "Ниже этого напряжения сеть считается полностью отключённой (инвертор работает от батареи)."
+      default: 150
+      selector:
+        number:
+          min: 90
+          max: 175
+          step: 1
+          unit_of_measurement: "V"
+
+    v_critical:
+      name: "Аварийный порог напряжения (В) — мгновенный сброс"
+      description: "Если напряжение сети падает ниже этого значения, ток заряда сразу сбрасывается до минимума."
+      default: 193
+      selector:
+        number:
+          min: 175
+          max: 210
+          step: 1
+          unit_of_measurement: "V"
+
+    v_low:
+      name: "Нижняя граница безопасного коридора V_low (В)"
+      description: "Ниже этого порога автоматизация начинает пропорционально снижать ток заряда."
+      default: 200
+      selector:
+        number:
+          min: 185
+          max: 220
+          step: 1
+          unit_of_measurement: "V"
+
+    v_high:
+      name: "Верхняя граница коридора V_high (В) — разрешение роста"
+      description: "Между V_low и V_high — мёртвая зона (0 записей). Выше V_high ток плавно растёт."
+      default: 208
+      selector:
+        number:
+          min: 195
+          max: 235
+          step: 1
+          unit_of_measurement: "V"
+
+    min_charge_current:
+      name: "Минимальный ток заряда при просадке (А)"
+      description: "Нижний предел тока при сильной просадке линии (автоматически учитывает аппаратный min сущности number)."
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 1
+          unit_of_measurement: "A"
+
+    max_charge_current:
+      name: "Максимальный ток заряда при хорошей сети (А)"
+      description: "Верхний предел тока заряда, когда линия свободна (не должен превышать Max Battery Charge Reg 210)."
+      default: 50
+      selector:
+        number:
+          min: 5
+          max: 120
+          step: 1
+          unit_of_measurement: "A"
+
+    safe_park_current:
+      name: "Безопасный стартовый / парковочный ток (А)"
+      description: "Выставляется однократно при 100% заряде батареи и во время блекаута для мягкого старта после подачи света."
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 40
+          step: 1
+          unit_of_measurement: "A"
+
+    step_up_amps:
+      name: "Шаг плавного повышения тока (А)"
+      description: "На сколько ампер прибавлять ток за один шаг при стабильно высоком напряжении (> V_high)."
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          unit_of_measurement: "A"
+
+    kp_down_amps_per_volt:
+      name: "Коэффициент снижения тока (А на 1 В ниже V_low)"
+      description: "На сколько ампер снижать заряд на каждый 1 В просадки ниже V_low (например, 3 А/В спасёт ~12 А при -4 В)."
+      default: 3.0
+      selector:
+        number:
+          min: 1.0
+          max: 10.0
+          step: 0.5
+          unit_of_measurement: "A/V"
+
+    ramp_up_interval_sec:
+      name: "Интервал повышения тока (сек)"
+      description: "Минимальная пауза между шагами повышения тока (защита от раскачки линии и износа EEPROM)."
+      default: 150
+      selector:
+        number:
+          min: 60
+          max: 900
+          step: 30
+          unit_of_measurement: "s"
+
+    step_down_cooldown_sec:
+      name: "Пауза после снижения тока для обновления опроса Modbus (сек)"
+      description: "Даёт интеграции Solarman/ESPHome (опрос 5–15 сек) увидеть новое напряжение перед следующим шагом."
+      default: 25
+      selector:
+        number:
+          min: 10
+          max: 120
+          step: 5
+          unit_of_measurement: "s"
+
+    max_grid_power_w:
+      name: "Лимит общей входной мощности из сети (Вт, 0 = выкл)"
+      description: "Если указан сенсор Grid Power, не даёт сумме (Нагрузка + Зарядка) превысить этот порог (например, 4000 Вт для 5 кВт инвертора)."
+      default: 4000
+      selector:
+        number:
+          min: 0
+          max: 15000
+          step: 100
+          unit_of_measurement: "W"
+
+    park_soc_pct:
+      name: "Порог полного заряда SOC (%)"
+      description: "Выше этого SOC регулировка замораживается на парковочном токе."
+      default: 99
+      selector:
+        number:
+          min: 85
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+
+    enable_logbook:
+      name: "Записывать изменения в Журнал событий (Logbook)"
+      description: "Логирует причину каждого изменения тока заряда в журнал Home Assistant."
+      default: true
+      selector:
+        boolean: {}
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: numeric_state
+    id: critical_voltage
+    entity_id: !input grid_voltage_sensor
+    above: !input v_offgrid_cutoff
+    below: !input v_critical
+
+  - platform: numeric_state
+    id: blackout_detected
+    entity_id: !input grid_voltage_sensor
+    below: !input v_offgrid_cutoff
+    for:
+      seconds: 15
+
+  - platform: time_pattern
+    id: periodic_tick
+    seconds: "/15"
+
+variables:
+  grid_voltage_sensor: !input grid_voltage_sensor
+  charge_current_number: !input charge_current_number
+  battery_soc_sensor: !input battery_soc_sensor
+  grid_power_sensor: !input grid_power_sensor
+  v_offgrid_cutoff: !input v_offgrid_cutoff
+  v_critical: !input v_critical
+  v_low: !input v_low
+  v_high: !input v_high
+  min_charge_current: !input min_charge_current
+  max_charge_current: !input max_charge_current
+  safe_park_current: !input safe_park_current
+  step_up_amps: !input step_up_amps
+  kp_down_amps_per_volt: !input kp_down_amps_per_volt
+  ramp_up_interval_sec: !input ramp_up_interval_sec
+  step_down_cooldown_sec: !input step_down_cooldown_sec
+  max_grid_power_w: !input max_grid_power_w
+  park_soc_pct: !input park_soc_pct
+  enable_logbook: !input enable_logbook
+
+  entities_valid: >-
+    {{ states(grid_voltage_sensor) not in ['unknown', 'unavailable', 'none', '']
+       and states(charge_current_number) not in ['unknown', 'unavailable', 'none', ''] }}
+
+  v_grid: "{{ states(grid_voltage_sensor) | float(-1) }}"
+  cur_amps: "{{ states(charge_current_number) | float(-1) }}"
+
+  hw_min: "{{ state_attr(charge_current_number, 'min') | float(0) }}"
+  hw_max: "{{ state_attr(charge_current_number, 'max') | float(120) }}"
+  hw_step: "{{ [state_attr(charge_current_number, 'step') | float(1), 1.0] | max }}"
+
+  eff_min: "{{ [hw_min | float, min_charge_current | float] | max }}"
+  eff_max: "{{ [hw_max | float, max_charge_current | float] | min }}"
+  eff_park: "{{ [[safe_park_current | float, eff_min | float] | max, eff_max | float] | min }}"
+
+  has_soc: >-
+    {{ battery_soc_sensor is string and (battery_soc_sensor | length > 0)
+       and states(battery_soc_sensor) not in ['unknown', 'unavailable', 'none', ''] }}
+  soc: "{{ states(battery_soc_sensor) | float(50) if has_soc else 50.0 }}"
+
+  has_pgrid: >-
+    {{ grid_power_sensor is string and (grid_power_sensor | length > 0)
+       and (max_grid_power_w | float(0)) > 0
+       and states(grid_power_sensor) not in ['unknown', 'unavailable', 'none', ''] }}
+  p_grid: "{{ states(grid_power_sensor) | float(0) if has_pgrid else 0.0 }}"
+
+  sec_since_change: >-
+    {% set st_obj = states[charge_current_number] %}
+    {% if st_obj is defined and st_obj.last_changed is defined %}
+      {{ (as_timestamp(now()) - as_timestamp(st_obj.last_changed)) | float(9999) }}
+    {% else %}
+      9999
+    {% endif %}
+
+  # Расчёт нового целевого тока и причины (AIMD + Deadband + Power Cap)
+  decision: >-
+    {% set vg = v_grid | float %}
+    {% set cur = cur_amps | float %}
+    {% set emin = eff_min | float %}
+    {% set emax = eff_max | float %}
+    {% set epark = eff_park | float %}
+    {% set hstep = hw_step | float %}
+    {% set sup = step_up_amps | float %}
+    {% set dt = sec_since_change | float %}
+    {% set watts_per_dc_amp = 58.0 %}
+
+    {% if not entities_valid or vg < 0 or cur < 0 %}
+      {{ {'write': false, 'target': cur, 'reason': 'entities_unavailable'} | to_json }}
+
+    {% elif vg < (v_offgrid_cutoff | float) %}
+      {% set tgt = (epark / hstep) | round(0) * hstep %}
+      {% set tgt = [[tgt, emin] | max, emax] | min %}
+      {{ {'write': (tgt - cur) | abs >= hstep, 'target': tgt,
+          'reason': 'Блекаут (' ~ (vg | round(1)) ~ ' В) -> парковка на стартовом токе ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+
+    {% elif has_soc and (soc | float) >= (park_soc_pct | float) %}
+      {% set tgt = (epark / hstep) | round(0) * hstep %}
+      {% set tgt = [[tgt, emin] | max, emax] | min %}
+      {{ {'write': (tgt - cur) | abs >= hstep, 'target': tgt,
+          'reason': 'АКБ заряжена (SOC ' ~ (soc | round(0) | int) ~ '%) -> парковка на ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+
+    {% elif vg < (v_critical | float) %}
+      {% set tgt = emin %}
+      {{ {'write': (tgt - cur) | abs >= hstep, 'target': tgt,
+          'reason': 'АВАРИЙНАЯ ПРОСАДКА (' ~ (vg | round(1)) ~ ' В < ' ~ v_critical ~ ' В) -> сброс до ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+
+    {% elif vg < (v_low | float) or (has_pgrid and (p_grid | float) > (max_grid_power_w | float)) %}
+      {% if dt < (step_down_cooldown_sec | float) %}
+        {{ {'write': false, 'target': cur, 'reason': 'cooldown_down'} | to_json }}
+      {% else %}
+        {% set drop_v = ((v_low | float) - vg) * (kp_down_amps_per_volt | float) if vg < (v_low | float) else 0.0 %}
+        {% set drop_p = ((p_grid | float) - (max_grid_power_w | float)) / watts_per_dc_amp if (has_pgrid and (p_grid | float) > (max_grid_power_w | float)) else 0.0 %}
+        {% set raw_drop = [drop_v, drop_p, sup] | max %}
+        {% set q_drop = ((raw_drop / hstep) | round(0, 'ceil')) * hstep %}
+        {% set tgt = [[cur - q_drop, emin] | max, emax] | min %}
+        {{ {'write': (cur - tgt) >= hstep, 'target': tgt,
+            'reason': 'Снижение нагрузки на сеть (V=' ~ (vg | round(1)) ~ ' В, P=' ~ (p_grid | round(0) | int) ~ ' Вт) -> ' ~ (cur | round(0) | int) ~ ' А -> ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+      {% endif %}
+
+    {% elif vg > (v_high | float) %}
+      {% if dt < (ramp_up_interval_sec | float) %}
+        {{ {'write': false, 'target': cur, 'reason': 'cooldown_up'} | to_json }}
+      {% elif has_pgrid and ((p_grid | float) + sup * watts_per_dc_amp) > (max_grid_power_w | float) %}
+        {{ {'write': false, 'target': cur, 'reason': 'power_cap_reached'} | to_json }}
+      {% else %}
+        {% set tgt = [[((cur + sup) / hstep) | round(0) * hstep, emin] | max, emax] | min %}
+        {{ {'write': (tgt - cur) >= hstep, 'target': tgt,
+            'reason': 'Сеть стабильна (' ~ (vg | round(1)) ~ ' В > ' ~ v_high ~ ' В) -> плавный рост ' ~ (cur | round(0) | int) ~ ' А -> ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+      {% endif %}
+
+    {% else %}
+      {{ {'write': false, 'target': cur, 'reason': 'deadband'} | to_json }}
+    {% endif %}
+
+  parsed_decision: "{{ decision | from_json if decision is string else decision }}"
+  should_write: "{{ parsed_decision.write | bool(false) }}"
+  target_amps: "{{ parsed_decision.target | float(0) }}"
+  change_reason: "{{ parsed_decision.reason | string }}"
+
+condition:
+  - condition: template
+    value_template: "{{ should_write }}"
+
+action:
+  - service: number.set_value
+    target:
+      entity_id: !input charge_current_number
+    data:
+      value: "{{ target_amps }}"
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ enable_logbook | bool(true) }}"
+        sequence:
+          - service: logbook.log
+            data:
+              name: "Deye Adaptive Charge"
+              message: "{{ change_reason }}"
+              entity_id: !input charge_current_number
