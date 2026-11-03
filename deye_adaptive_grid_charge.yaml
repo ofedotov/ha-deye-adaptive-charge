@@ -3,37 +3,41 @@ blueprint:
   description: >
     Автоматически регулирует ток заряда аккумулятора от сети (Modbus Reg 230 —
     Grid Charge Battery Current) на инверторах Deye / Sunsynk (через локальные
-    интеграции Solarman, ESPHome или Sunsynk Add-on), удерживая входное
-    напряжение сети не ниже безопасного порога и защищая EEPROM инвертора от
-    лишних перезаписей.
+    интеграции Solarman, ESPHome или Sunsynk Add-on), отталкиваясь от порога
+    отключения самого инвертора от сети (V_cutoff) и защищая EEPROM от лишних
+    перезаписей.
+
+
+    Все рабочие пороги автоматически рассчитываются от порога отключения инвертора (V_cutoff):
+
+    • V_critical = V_cutoff + запас аварийного сброса (по умолчанию +8 В, напр. 185 + 8 = 193 В)
+
+    • V_low      = V_cutoff + запас начала снижения (по умолчанию +15 В, напр. 185 + 15 = 200 В)
+
+    • V_high     = V_low + ширина мёртвой зоны (по умолчанию +8 В, напр. 200 + 8 = 208 В)
 
 
     Алгоритм (асимметричный AIMD с мёртвой зоной):
 
-    1. Блекаут (V_grid < порога блекаута): однократно паркует ток на безопасном
-       стартовом значении (по умолчанию 10 А), чтобы при подаче света не просадить
-       линию высоким пусковым током заряда.
+    1. Сеть отключена (V_grid < 100 В или разомкнуто реле Grid Connected): однократно
+       паркует ток на безопасном стартовом значении (10 А) для мягкого старта после включения.
 
-    2. Батарея заряжена (SOC >= порога парковки): паркует ток на безопасном
-       значении и прекращает запись в Modbus.
+    2. Батарея заряжена (SOC >= порога парковки): паркует ток на 10 А и замораживает запись.
 
-    3. Аварийная просадка (V_grid < аварийного порога): мгновенно сбрасывает ток
-       заряда до минимума (0 А).
+    3. Аварийная просадка (V_grid < V_critical): мгновенно сбрасывает ток заряда до минимума (0 А).
 
-    4. Ниже коридора (V_crit <= V_grid < V_low) или превышение лимита мощности
-       ввода: пропорционально снижает ток заряда (не чаще раза в 25 сек).
+    4. Ниже коридора (V_critical <= V_grid < V_low) или превышение лимита мощности ввода:
+       пропорционально снижает ток заряда (не чаще раза в 25 сек).
 
-    5. Безопасный коридор (V_low <= V_grid <= V_high): мёртвая зона — 0 записей
-       в регистр инвертора.
+    5. Безопасный коридор (V_low <= V_grid <= V_high): мёртвая зона — 0 записей в Modbus.
 
-    6. Свободная линия (V_grid > V_high): плавно повышает ток на заданный шаг
-       раз в 2–3 минуты вплоть до максимума с учётом запаса мощности ввода.
+    6. Свободная линия (V_grid > V_high): плавно повышает ток (+5 А раз в 150 сек) до максимума.
   domain: automation
   source_url: https://github.com/ofedotov/ha-deye-adaptive-charge/blob/main/deye_adaptive_grid_charge.yaml
   input:
     inverter_device:
       name: "Устройство инвертора (необязательно)"
-      description: "Выберите устройство инвертора Deye/Sunsynk в Home Assistant (опционально, для удобства идентификации)."
+      description: "Выберите устройство инвертора Deye/Sunsynk в Home Assistant (опционально, для справки)."
       default:
       selector:
         device: {}
@@ -52,6 +56,41 @@ blueprint:
         entity:
           domain: number
 
+    inverter_cutoff_entity:
+      name: "Сущность нижнего порога сети инвертора (Grid Voltage Low — опционально)"
+      description: >
+        Опционально: сущность уставки отключения инвертора от сети (Reg 288, number или sensor).
+        Если поле пустое — используется значение ползунка ниже.
+        Внимание: если в инверторе активна защита IP Protection (EN50549 отключает при ~184–185 В,
+        даже когда Reg 288 = 170 В), оставьте это поле пустым и задайте реальный порог ползунком ниже.
+      default:
+      selector:
+        entity:
+          domain:
+            - number
+            - sensor
+
+    inverter_cutoff_voltage:
+      name: "Порог отключения инвертора от сети вручную (В)"
+      description: "Реальное напряжение, ниже которого инвертор размыкает реле сети (используется, если сущность выше не выбрана; стандарт EU/EN50549 = 185 В)."
+      default: 185
+      selector:
+        number:
+          min: 150
+          max: 210
+          step: 1
+          unit_of_measurement: "V"
+
+    grid_connected_sensor:
+      name: "Сенсор статуса реле сети (Grid Connected Status — опционально)"
+      description: "Опционально: binary_sensor или sensor статуса подключения к сети (Reg 194). Позволяет мгновенно определить размыкание входного реле даже когда напряжение на входе подпрыгнуло без нагрузки."
+      default:
+      selector:
+        entity:
+          domain:
+            - binary_sensor
+            - sensor
+
     battery_soc_sensor:
       name: "Сенсор заряда батареи SOC % (рекомендуется)"
       description: "Сущность уровня заряда АКБ (Reg 184). Замораживает записи в память инвертора, когда батарея заряжена."
@@ -68,47 +107,36 @@ blueprint:
         entity:
           domain: sensor
 
-    v_offgrid_cutoff:
-      name: "Порог определения блекаута (В)"
-      description: "Ниже этого напряжения сеть считается полностью отключённой (инвертор работает от батареи)."
-      default: 150
+    critical_margin_v:
+      name: "Запас до аварийного сброса (+В выше порога отключения инвертора)"
+      description: "V_critical = V_cutoff + этот запас (по умолчанию +8 В: при пороге 185 В мгновенный сброс в 0 А сработает ниже 193 В)."
+      default: 8
       selector:
         number:
-          min: 90
-          max: 175
+          min: 3
+          max: 25
           step: 1
           unit_of_measurement: "V"
 
-    v_critical:
-      name: "Аварийный порог напряжения (В) — мгновенный сброс"
-      description: "Если напряжение сети падает ниже этого значения, ток заряда сразу сбрасывается до минимума."
-      default: 193
+    low_margin_v:
+      name: "Запас до начала снижения тока (+В выше порога отключения инвертора)"
+      description: "V_low = V_cutoff + этот запас (по умолчанию +15 В: при пороге 185 В плавное снижение тока начнётся ниже 200 В)."
+      default: 15
       selector:
         number:
-          min: 175
-          max: 210
+          min: 6
+          max: 35
           step: 1
           unit_of_measurement: "V"
 
-    v_low:
-      name: "Нижняя граница безопасного коридора V_low (В)"
-      description: "Ниже этого порога автоматизация начинает пропорционально снижать ток заряда."
-      default: 200
+    deadband_width_v:
+      name: "Ширина безопасного коридора / мёртвой зоны (В)"
+      description: "V_high = V_low + эта ширина (по умолчанию +8 В: коридор 200..208 В без единой записи в память; выше 208 В — плавный рост тока)."
+      default: 8
       selector:
         number:
-          min: 185
-          max: 220
-          step: 1
-          unit_of_measurement: "V"
-
-    v_high:
-      name: "Верхняя граница коридора V_high (В) — разрешение роста"
-      description: "Между V_low и V_high — мёртвая зона (0 записей). Выше V_high ток плавно растёт."
-      default: 208
-      selector:
-        number:
-          min: 195
-          max: 235
+          min: 4
+          max: 20
           step: 1
           unit_of_measurement: "V"
 
@@ -136,7 +164,7 @@ blueprint:
 
     safe_park_current:
       name: "Безопасный стартовый / парковочный ток (А)"
-      description: "Выставляется однократно при 100% заряде батареи и во время блекаута для мягкого старта после подачи света."
+      description: "Выставляется однократно при 100% заряде батареи и при отключении сети для мягкого старта после подачи света."
       default: 10
       selector:
         number:
@@ -158,7 +186,7 @@ blueprint:
 
     kp_down_amps_per_volt:
       name: "Коэффициент снижения тока (А на 1 В ниже V_low)"
-      description: "На сколько ампер снижать заряд на каждый 1 В просадки ниже V_low (например, 3 А/В спасёт ~12 А при -4 В)."
+      description: "На сколько ампер снижать заряд на каждый 1 В просадки ниже V_low (например, 3 А/В срежет ~12 А при -4 В)."
       default: 3.0
       selector:
         number:
@@ -220,34 +248,48 @@ blueprint:
 
 mode: single
 max_exceeded: silent
+trace:
+  stored_traces: 20
+
+trigger_variables:
+  _v_grid_sensor: !input grid_voltage_sensor
+  _v_cut_entity: !input inverter_cutoff_entity
+  _v_cut_manual: !input inverter_cutoff_voltage
+  _crit_margin: !input critical_margin_v
 
 trigger:
-  - platform: numeric_state
+  - platform: template
     id: critical_voltage
-    entity_id: !input grid_voltage_sensor
-    above: !input v_offgrid_cutoff
-    below: !input v_critical
+    value_template: >-
+      {% set vg = states(_v_grid_sensor) | float(-1) %}
+      {% set has_cut_ent = _v_cut_entity is string and (_v_cut_entity | length > 0)
+         and states(_v_cut_entity) not in ['unknown', 'unavailable', 'none', ''] %}
+      {% set raw_cut = states(_v_cut_entity) | float(185) if has_cut_ent else (_v_cut_manual | float(185)) %}
+      {% set v_cut = raw_cut * 0.1 if raw_cut > 500 else raw_cut %}
+      {{ vg >= 100.0 and vg < (v_cut + (_crit_margin | float(8))) }}
 
   - platform: numeric_state
     id: blackout_detected
     entity_id: !input grid_voltage_sensor
-    below: !input v_offgrid_cutoff
+    below: 100
     for:
-      seconds: 15
+      seconds: 10
 
   - platform: time_pattern
     id: periodic_tick
-    seconds: "/15"
+    seconds: "/20"
 
 variables:
   grid_voltage_sensor: !input grid_voltage_sensor
   charge_current_number: !input charge_current_number
+  inverter_cutoff_entity: !input inverter_cutoff_entity
+  inverter_cutoff_voltage: !input inverter_cutoff_voltage
+  grid_connected_sensor: !input grid_connected_sensor
   battery_soc_sensor: !input battery_soc_sensor
   grid_power_sensor: !input grid_power_sensor
-  v_offgrid_cutoff: !input v_offgrid_cutoff
-  v_critical: !input v_critical
-  v_low: !input v_low
-  v_high: !input v_high
+  critical_margin_v: !input critical_margin_v
+  low_margin_v: !input low_margin_v
+  deadband_width_v: !input deadband_width_v
   min_charge_current: !input min_charge_current
   max_charge_current: !input max_charge_current
   safe_park_current: !input safe_park_current
@@ -265,6 +307,29 @@ variables:
 
   v_grid: "{{ states(grid_voltage_sensor) | float(-1) }}"
   cur_amps: "{{ states(charge_current_number) | float(-1) }}"
+
+  # Определение порога отключения инвертора (из сущности Reg 288 или из ползунка)
+  has_cutoff_entity: >-
+    {{ inverter_cutoff_entity is string and (inverter_cutoff_entity | length > 0)
+       and states(inverter_cutoff_entity) not in ['unknown', 'unavailable', 'none', ''] }}
+  raw_cutoff_v: "{{ states(inverter_cutoff_entity) | float(185) if has_cutoff_entity else (inverter_cutoff_voltage | float(185)) }}"
+  v_cutoff: "{{ (raw_cutoff_v | float * 0.1) if (raw_cutoff_v | float) > 500 else (raw_cutoff_v | float) }}"
+
+  # Автоматический расчёт рабочих порогов от V_cutoff
+  v_critical: "{{ (v_cutoff | float) + (critical_margin_v | float(8)) }}"
+  eff_low_margin: "{{ [low_margin_v | float(15), (critical_margin_v | float(8)) + 2.0] | max }}"
+  v_low: "{{ (v_cutoff | float) + (eff_low_margin | float) }}"
+  v_high: "{{ (v_low | float) + (deadband_width_v | float(8)) }}"
+
+  # Определение размыкания реле сети (по сенсору Grid Connected или по V_grid < 100 В)
+  relay_known_off: >-
+    {% if grid_connected_sensor is string and (grid_connected_sensor | length > 0)
+          and states(grid_connected_sensor) not in ['unknown', 'unavailable', 'none', ''] %}
+      {% set gs = states(grid_connected_sensor) | lower | trim %}
+      {{ gs in ['off', '0', '0.0', 'false', 'disconnected', 'off-grid', 'off_grid', 'island', 'отключено'] }}
+    {% else %}
+      false
+    {% endif %}
 
   hw_min: "{{ state_attr(charge_current_number, 'min') | float(0) }}"
   hw_max: "{{ state_attr(charge_current_number, 'max') | float(120) }}"
@@ -293,10 +358,12 @@ variables:
       9999
     {% endif %}
 
-  # Расчёт нового целевого тока и причины (AIMD + Deadband + Power Cap)
   decision: >-
     {% set vg = v_grid | float %}
     {% set cur = cur_amps | float %}
+    {% set vcrit = v_critical | float %}
+    {% set vlow = v_low | float %}
+    {% set vhigh = v_high | float %}
     {% set emin = eff_min | float %}
     {% set emax = eff_max | float %}
     {% set epark = eff_park | float %}
@@ -308,11 +375,11 @@ variables:
     {% if not entities_valid or vg < 0 or cur < 0 %}
       {{ {'write': false, 'target': cur, 'reason': 'entities_unavailable'} | to_json }}
 
-    {% elif vg < (v_offgrid_cutoff | float) %}
+    {% elif vg < 100.0 or (relay_known_off | bool(false)) %}
       {% set tgt = (epark / hstep) | round(0) * hstep %}
       {% set tgt = [[tgt, emin] | max, emax] | min %}
       {{ {'write': (tgt - cur) | abs >= hstep, 'target': tgt,
-          'reason': 'Блекаут (' ~ (vg | round(1)) ~ ' В) -> парковка на стартовом токе ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+          'reason': 'Сеть отключена (V=' ~ (vg | round(1)) ~ ' В) -> парковка на стартовом токе ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
 
     {% elif has_soc and (soc | float) >= (park_soc_pct | float) %}
       {% set tgt = (epark / hstep) | round(0) * hstep %}
@@ -320,25 +387,25 @@ variables:
       {{ {'write': (tgt - cur) | abs >= hstep, 'target': tgt,
           'reason': 'АКБ заряжена (SOC ' ~ (soc | round(0) | int) ~ '%) -> парковка на ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
 
-    {% elif vg < (v_critical | float) %}
+    {% elif vg < vcrit %}
       {% set tgt = emin %}
       {{ {'write': (tgt - cur) | abs >= hstep, 'target': tgt,
-          'reason': 'АВАРИЙНАЯ ПРОСАДКА (' ~ (vg | round(1)) ~ ' В < ' ~ v_critical ~ ' В) -> сброс до ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+          'reason': 'АВАРИЙНАЯ ПРОСАДКА (' ~ (vg | round(1)) ~ ' В < ' ~ (vcrit | round(0) | int) ~ ' В) -> сброс до ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
 
-    {% elif vg < (v_low | float) or (has_pgrid and (p_grid | float) > (max_grid_power_w | float)) %}
+    {% elif vg < vlow or (has_pgrid and (p_grid | float) > (max_grid_power_w | float)) %}
       {% if dt < (step_down_cooldown_sec | float) %}
         {{ {'write': false, 'target': cur, 'reason': 'cooldown_down'} | to_json }}
       {% else %}
-        {% set drop_v = ((v_low | float) - vg) * (kp_down_amps_per_volt | float) if vg < (v_low | float) else 0.0 %}
+        {% set drop_v = (vlow - vg) * (kp_down_amps_per_volt | float) if vg < vlow else 0.0 %}
         {% set drop_p = ((p_grid | float) - (max_grid_power_w | float)) / watts_per_dc_amp if (has_pgrid and (p_grid | float) > (max_grid_power_w | float)) else 0.0 %}
         {% set raw_drop = [drop_v, drop_p, sup] | max %}
         {% set q_drop = ((raw_drop / hstep) | round(0, 'ceil')) * hstep %}
         {% set tgt = [[cur - q_drop, emin] | max, emax] | min %}
         {{ {'write': (cur - tgt) >= hstep, 'target': tgt,
-            'reason': 'Снижение нагрузки на сеть (V=' ~ (vg | round(1)) ~ ' В, P=' ~ (p_grid | round(0) | int) ~ ' Вт) -> ' ~ (cur | round(0) | int) ~ ' А -> ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+            'reason': 'Снижение нагрузки на сеть (V=' ~ (vg | round(1)) ~ ' В < ' ~ (vlow | round(0) | int) ~ ' В, P=' ~ (p_grid | round(0) | int) ~ ' Вт) -> ' ~ (cur | round(0) | int) ~ ' А -> ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
       {% endif %}
 
-    {% elif vg > (v_high | float) %}
+    {% elif vg > vhigh %}
       {% if dt < (ramp_up_interval_sec | float) %}
         {{ {'write': false, 'target': cur, 'reason': 'cooldown_up'} | to_json }}
       {% elif has_pgrid and ((p_grid | float) + sup * watts_per_dc_amp) > (max_grid_power_w | float) %}
@@ -346,7 +413,7 @@ variables:
       {% else %}
         {% set tgt = [[((cur + sup) / hstep) | round(0) * hstep, emin] | max, emax] | min %}
         {{ {'write': (tgt - cur) >= hstep, 'target': tgt,
-            'reason': 'Сеть стабильна (' ~ (vg | round(1)) ~ ' В > ' ~ v_high ~ ' В) -> плавный рост ' ~ (cur | round(0) | int) ~ ' А -> ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
+            'reason': 'Сеть стабильна (' ~ (vg | round(1)) ~ ' В > ' ~ (vhigh | round(0) | int) ~ ' В) -> плавный рост ' ~ (cur | round(0) | int) ~ ' А -> ' ~ (tgt | round(0) | int) ~ ' А'} | to_json }}
       {% endif %}
 
     {% else %}
